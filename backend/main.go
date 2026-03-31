@@ -4,27 +4,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
-	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
-
-type Station struct {
-	Name  string   `json:"name"`
-	Code  string   `json:"code"`
-	Lines []string `json:"lines"`
-	Lat   float64  `json:"lat"`
-	Lng   float64  `json:"lng"`
-}
 
 type MeetupRequest struct {
 	StationA string `json:"stationA"`
@@ -35,6 +24,7 @@ type CandidateResult struct {
 	Station    Station `json:"station"`
 	TimeFromA  int     `json:"timeFromA"`
 	TimeFromB  int     `json:"timeFromB"`
+	MinTime    int     `json:"minTime"`
 	MaxTime    int     `json:"maxTime"`
 	Difference int     `json:"difference"`
 	Score      float64 `json:"score"`
@@ -45,27 +35,6 @@ type MeetupResponse struct {
 	StationB   Station           `json:"stationB"`
 	Candidates []CandidateResult `json:"candidates"`
 	Error      string            `json:"error,omitempty"`
-}
-
-// ─── Load Stations ────────────────────────────────────────────────────────────
-
-func loadStations() ([]Station, error) {
-	data, err := os.ReadFile("stations.json")
-	if err != nil {
-		return nil, err
-	}
-	var stations []Station
-	err = json.Unmarshal(data, &stations)
-	return stations, err
-}
-
-func findStation(stations []Station, name string) (Station, bool) {
-	for _, s := range stations {
-		if s.Name == name {
-			return s, true
-		}
-	}
-	return Station{}, false
 }
 
 // ─── Google Distance Matrix ───────────────────────────────────────────────────
@@ -148,141 +117,6 @@ func mockTravelTimes(destinations []Station) []int {
 	return times
 }
 
-// ─── Handlers ─────────────────────────────────────────────────────────────────
-
-func meetupHandler(stations []Station, apiKey string, limiter *RedisLimiter) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Content-Type", "application/json")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		if r.Method != http.MethodPost {
-			json.NewEncoder(w).Encode(MeetupResponse{Error: "POST only"})
-			return
-		}
-
-		var req MeetupRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			json.NewEncoder(w).Encode(MeetupResponse{Error: "invalid request"})
-			return
-		}
-
-		stationA, okA := findStation(stations, req.StationA)
-		stationB, okB := findStation(stations, req.StationB)
-
-		if !okA || !okB {
-			json.NewEncoder(w).Encode(MeetupResponse{Error: "station not found"})
-			return
-		}
-
-		if stationA.Name == stationB.Name {
-			json.NewEncoder(w).Encode(MeetupResponse{Error: "please choose two different stations"})
-			return
-		}
-
-		originA := fmt.Sprintf("%.6f,%.6f", stationA.Lat, stationA.Lng)
-		originB := fmt.Sprintf("%.6f,%.6f", stationB.Lat, stationB.Lng)
-
-		// Fetch travel times from both stations in parallel
-		var timesA, timesB []int
-		var errA, errB error
-
-		if os.Getenv("USE_MOCK") == "true" {
-			// Mock mode — no API calls, no cost
-			log.Printf("MOCK: returning fake travel times for %s and %s", stationA.Name, stationB.Name)
-			timesA = mockTravelTimes(stations)
-			timesB = mockTravelTimes(stations)
-		} else {
-			// Real mode — calls Google Distance Matrix API
-			if !limiter.allow() {
-				w.WriteHeader(http.StatusTooManyRequests)
-				json.NewEncoder(w).Encode(MeetupResponse{Error: "monthly search limit reached"})
-				return
-			}
-			log.Printf("Real API call — %d searches remaining", limiter.remaining())
-			var wg sync.WaitGroup
-			wg.Add(2)
-
-			go func() {
-				defer wg.Done()
-				timesA, errA = fetchTravelTimes(apiKey, originA, stations)
-			}()
-
-			go func() {
-				defer wg.Done()
-				timesB, errB = fetchTravelTimes(apiKey, originB, stations)
-			}()
-
-			wg.Wait()
-
-			if errA != nil || errB != nil {
-				json.NewEncoder(w).Encode(MeetupResponse{Error: "failed to fetch travel times"})
-				return
-			}
-		}
-
-		// Score every candidate station
-		var candidates []CandidateResult
-		for i, s := range stations {
-			if s.Name == stationA.Name || s.Name == stationB.Name {
-				continue
-			}
-
-			tA := timesA[i]
-			tB := timesB[i]
-			if tA >= 99999 || tB >= 99999 {
-				continue
-			}
-
-			diff := int(math.Abs(float64(tA - tB)))
-			maxTime := tA
-			if tB > maxTime {
-				maxTime = tB
-			}
-
-			score := float64(diff)*0.6 + float64(maxTime)*0.4
-
-			candidates = append(candidates, CandidateResult{
-				Station:    s,
-				TimeFromA:  tA,
-				TimeFromB:  tB,
-				MaxTime:    maxTime,
-				Difference: diff,
-				Score:      score,
-			})
-		}
-
-		// Sort by score, lowest is best
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].Score < candidates[j].Score
-		})
-
-		// Return top 5
-		if len(candidates) > 5 {
-			candidates = candidates[:5]
-		}
-
-		json.NewEncoder(w).Encode(MeetupResponse{
-			StationA:   stationA,
-			StationB:   stationB,
-			Candidates: candidates,
-		})
-	}
-}
-
-func stationsHandler(stations []Station) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(stations)
-	}
-}
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -294,11 +128,11 @@ func main() {
 	}
 	log.Printf("API key loaded ✓")
 
-	stations, err := loadStations()
+	store, err := NewStationStore("stations.json")
 	if err != nil {
 		log.Fatalf("Failed to load stations: %v", err)
 	}
-	log.Printf("Loaded %d stations ✓", len(stations))
+	log.Printf("Loaded %d stations ✓", len(store.All()))
 
 	limiter := newRedisLimiter(30)
 
@@ -313,8 +147,8 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]int{"remaining": limiter.remaining()})
 	})
-	mux.HandleFunc("/api/stations", stationsHandler(stations))
-	mux.HandleFunc("/api/find-meetup", meetupHandler(stations, apiKey, limiter))
+	mux.HandleFunc("/api/stations", stationsHandler(store))
+	mux.HandleFunc("/api/find-meetup", meetupHandler(store, apiKey, limiter))
 
 	port := os.Getenv("PORT")
 	if port == "" {
