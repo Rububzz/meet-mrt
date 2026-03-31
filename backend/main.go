@@ -150,7 +150,7 @@ func mockTravelTimes(destinations []Station) []int {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-func meetupHandler(stations []Station, apiKey string) http.HandlerFunc {
+func meetupHandler(stations []Station, apiKey string, limiter *RedisLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -199,6 +199,12 @@ func meetupHandler(stations []Station, apiKey string) http.HandlerFunc {
 			timesB = mockTravelTimes(stations)
 		} else {
 			// Real mode — calls Google Distance Matrix API
+			if !limiter.allow() {
+				w.WriteHeader(http.StatusTooManyRequests)
+				json.NewEncoder(w).Encode(MeetupResponse{Error: "monthly search limit reached"})
+				return
+			}
+			log.Printf("Real API call — %d searches remaining", limiter.remaining())
 			var wg sync.WaitGroup
 			wg.Add(2)
 
@@ -294,14 +300,21 @@ func main() {
 	}
 	log.Printf("Loaded %d stations ✓", len(stations))
 
+	limiter := newRedisLimiter(30)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("/api/remaining", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"remaining": limiter.remaining()})
+	})
 	mux.HandleFunc("/api/stations", stationsHandler(stations))
-	mux.HandleFunc("/api/find-meetup", meetupHandler(stations, apiKey))
+	mux.HandleFunc("/api/find-meetup", meetupHandler(stations, apiKey, limiter))
 
 	port := os.Getenv("PORT")
 	if port == "" {
